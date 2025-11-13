@@ -44,9 +44,9 @@ fi
 echo ""
 echo "Step 3: Training Position-Velocity model on full dataset..."
 echo "  - Window size: 100"
-echo "  - Stride: 50 (샘플 수 줄여서 속도 향상)"
+echo "  - Stride: 10 (더 많은 샘플로 정확도 향상)"
 echo "  - Batch size: 32"
-echo "  - Epochs: 30"
+echo "  - Epochs: 200 (장시간 학습으로 최고 성능 달성)"
 echo "  - Hidden dims: 128"
 echo ""
 
@@ -55,9 +55,9 @@ python train/train_pv_ihs.py \
     --embeddings checkpoint/ihs_sensor_embeddings.pt \
     --checkpoint checkpoint/pv_model_ihs_full.pt \
     --window-size 100 \
-    --stride 50 \
+    --stride 10 \
     --batch-size 32 \
-    --epochs 30 \
+    --epochs 200 \
     --learning-rate 3e-4 \
     --weight-decay 5e-4 \
     --patience 15 \
