@@ -1,6 +1,6 @@
 
 archived/
-
+data/ihsdata/processed/events.csv
 compare_lite_models.py
 comparison_results.json
 evaluate_test.py
