@@ -1,7 +1,10 @@
 
 archived/
 
-
+compare_lite_models.py
+comparison_results.json
+evaluate_test.py
+run_pv_training.sh
 # Byte-compiled / cache
 __pycache__/
 *.py[cod]
