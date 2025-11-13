@@ -35,8 +35,11 @@ IHS 데이터셋의 센서/활동 수에 맞춰 자동으로 모델 차원을 �
 import argparse
 import json
 import time
+import pickle
 from pathlib import Path
 from typing import Dict, List, Tuple
+from multiprocessing import Pool, cpu_count
+from hashlib import md5
 
 import numpy as np
 import pandas as pd
@@ -72,22 +75,15 @@ def build_vocab(events: pd.DataFrame) -> Tuple[Dict, Dict]:
     return sensor_vocab, activity_vocab
 
 
-def extract_features(
-    events: pd.DataFrame,
-    sensor_vocab: Dict,
-    activity_vocab: Dict,
-    sensor_embeddings: np.ndarray,
-    window_size: int,
-    stride: int,
-    train_ratio: float = 0.8,
-    seed: int = 42
-) -> Tuple[List, List]:
-    """
-    RichFeatures 추출 및 train/val 분할
+def _extract_activity_features(args):
+    """병렬 처리용 헬퍼 함수"""
+    activity, group, sensor_vocab, activity_vocab, sensor_embeddings, window_size, stride, use_dynamic_window = args
     
-    Returns:
-        train_features, val_features
-    """
+    # 빈 문자열 활동은 건너뛰기
+    if pd.isna(activity) or activity.strip() == '':
+        return activity, []
+    
+    # Extractor 초기화 (각 프로세스마다)
     extractor = RichFeatureExtractor(
         sensor_vocab=sensor_vocab,
         activity_vocab=activity_vocab,
@@ -96,26 +92,117 @@ def extract_features(
         time_scale=1.0
     )
     
-    # 활동별로 그룹화
-    all_features = []
-    activity_counts = {}
+    group = group.sort_values('timestamp').reset_index(drop=True)
     
+    # 동적 window size (옵션)
+    if use_dynamic_window:
+        effective_window = min(window_size, len(group))
+        if effective_window < 10:
+            return activity, []
+    else:
+        if len(group) < window_size:
+            return activity, []
+        effective_window = window_size
+    
+    features = extractor.extract_sequence(
+        events=group,
+        window_size=effective_window,
+        stride=stride
+    )
+    
+    return activity, features
+
+
+def extract_features(
+    events: pd.DataFrame,
+    sensor_vocab: Dict,
+    activity_vocab: Dict,
+    sensor_embeddings: np.ndarray,
+    window_size: int,
+    stride: int,
+    train_ratio: float = 0.8,
+    seed: int = 42,
+    use_dynamic_window: bool = False,
+    n_jobs: int = -1
+) -> Tuple[List, List]:
+    """
+    RichFeatures 추출 및 train/val 분할 (병렬 처리)
+    
+    Args:
+        n_jobs: 병렬 처리 워커 수 (-1: 모든 CPU 사용, 1: 병렬 처리 안함)
+    
+    Returns:
+        train_features, val_features
+    """
+    # 활동별로 그룹화
     grouped = list(events.groupby('activity'))
     print(f"   Processing {len(grouped)} activities...")
     
-    for activity, group in tqdm(grouped, desc="  Extracting features by activity"):
-        # 빈 문자열 활동은 건너뛰기
-        if pd.isna(activity) or activity.strip() == '':
-            continue
-        
-        group = group.sort_values('timestamp').reset_index(drop=True)
-        features = extractor.extract_sequence(
-            events=group,
-            window_size=window_size,
-            stride=stride
+    # 병렬 처리 준비
+    if n_jobs == 1:
+        # 단일 프로세스 (기존 방식)
+        extractor = RichFeatureExtractor(
+            sensor_vocab=sensor_vocab,
+            activity_vocab=activity_vocab,
+            sensor_embeddings=sensor_embeddings,
+            ema_alpha=0.6,
+            time_scale=1.0
         )
-        all_features.extend(features)
-        activity_counts[activity] = len(features)
+        
+        all_features = []
+        activity_counts = {}
+        
+        for activity, group in tqdm(grouped, desc="  Extracting features by activity", ncols=100):
+            if pd.isna(activity) or activity.strip() == '':
+                continue
+            
+            group = group.sort_values('timestamp').reset_index(drop=True)
+            
+            if use_dynamic_window:
+                effective_window = min(window_size, len(group))
+                if effective_window < 10:
+                    continue
+            else:
+                if len(group) < window_size:
+                    continue
+                effective_window = window_size
+            
+            features = extractor.extract_sequence(
+                events=group,
+                window_size=effective_window,
+                stride=stride
+            )
+            all_features.extend(features)
+            activity_counts[activity] = len(features)
+    else:
+        # 병렬 처리
+        num_workers = cpu_count() if n_jobs == -1 else n_jobs
+        print(f"   Using {num_workers} parallel workers...")
+        
+        # 작업 준비
+        tasks = [
+            (activity, group, sensor_vocab, activity_vocab, sensor_embeddings, 
+             window_size, stride, use_dynamic_window)
+            for activity, group in grouped
+        ]
+        
+        # 병렬 실행
+        all_features = []
+        activity_counts = {}
+        
+        with Pool(processes=num_workers) as pool:
+            results = list(tqdm(
+                pool.imap(_extract_activity_features, tasks),
+                total=len(tasks),
+                desc="  Extracting features by activity",
+                ncols=100
+            ))
+        
+        # 결과 수집
+        for activity, features in results:
+            if features:
+                all_features.extend(features)
+                activity_counts[activity] = len(features)
     
     print(f"\n📦 Feature Extraction Statistics:")
     print(f"   Total samples: {len(all_features):,}")
@@ -138,9 +225,10 @@ def train_epoch(
     loader: DataLoader,
     criterion: MultiTaskLoss,
     optimizer: torch.optim.Optimizer,
-    device: str
+    device: str,
+    use_amp: bool = False
 ) -> Dict[str, float]:
-    """한 에폭 학습"""
+    """한 에폭 학습 (AMP 지원)"""
     model.train()
     
     total_loss = 0.0
@@ -152,23 +240,38 @@ def train_epoch(
     all_preds = []
     all_labels = []
     
-    for batch in tqdm(loader, desc="  Training", leave=False):
-        X_base = batch['X_base'].to(device)
-        sensor_ids = batch['sensor_ids'].to(device)
-        timestamps = batch['timestamps'].to(device)
-        labels = batch['labels'].to(device)
+    # AMP scaler (Mixed Precision Training)
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    
+    for batch in tqdm(loader, desc="  Training", leave=False, ncols=100):
+        X_base = batch['X_base'].to(device, non_blocking=True)
+        sensor_ids = batch['sensor_ids'].to(device, non_blocking=True)
+        timestamps = batch['timestamps'].to(device, non_blocking=True)
+        labels = batch['labels'].to(device, non_blocking=True)
         
-        # Forward
-        logits, aux = model(X_base, sensor_ids, timestamps, return_aux=True)
+        optimizer.zero_grad(set_to_none=True)  # 더 빠른 gradient zero
         
-        # Loss
-        loss, losses = criterion(logits, labels, aux, model.pos_head.positions)
-        
-        # Backward
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        # Forward with AMP
+        if use_amp:
+            with torch.amp.autocast('cuda'):
+                logits, aux = model(X_base, sensor_ids, timestamps, return_aux=True)
+                loss, losses = criterion(logits, labels, aux, model.pos_head.positions)
+            
+            # Backward with scaling
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # 일반 Forward
+            logits, aux = model(X_base, sensor_ids, timestamps, return_aux=True)
+            loss, losses = criterion(logits, labels, aux, model.pos_head.positions)
+            
+            # Backward
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
         
         # Metrics
         total_loss += loss.item() * len(labels)
@@ -217,21 +320,22 @@ def eval_epoch(
     all_preds = []
     all_labels = []
     
-    for batch in tqdm(loader, desc="  Validating", leave=False):
-        X_base = batch['X_base'].to(device)
-        sensor_ids = batch['sensor_ids'].to(device)
-        timestamps = batch['timestamps'].to(device)
-        labels = batch['labels'].to(device)
-        
-        # Forward
-        logits, aux = model(X_base, sensor_ids, timestamps, return_aux=True)
-        
-        # Loss
-        loss, losses = criterion(logits, labels, aux, model.pos_head.positions)
-        
-        # Metrics
-        total_loss += loss.item() * len(labels)
-        pred = logits.argmax(dim=-1)
+    with torch.no_grad():  # 메모리 절약
+        for batch in tqdm(loader, desc="  Validating", leave=False, ncols=100):
+            X_base = batch['X_base'].to(device, non_blocking=True)
+            sensor_ids = batch['sensor_ids'].to(device, non_blocking=True)
+            timestamps = batch['timestamps'].to(device, non_blocking=True)
+            labels = batch['labels'].to(device, non_blocking=True)
+            
+            # Forward
+            logits, aux = model(X_base, sensor_ids, timestamps, return_aux=True)
+            
+            # Loss
+            loss, losses = criterion(logits, labels, aux, model.pos_head.positions)
+            
+            # Metrics
+            total_loss += loss.item() * len(labels)
+            pred = logits.argmax(dim=-1)
         total_correct += (pred == labels).sum().item()
         total_samples += len(labels)
         
@@ -291,14 +395,49 @@ def main(args):
     
     emb_dim = sensor_embeddings.shape[1]
     
-    # Extract features
-    print(f"\n🔧 Extracting rich features (window={args.window_size}, stride={args.stride}, seed={args.seed})")
-    train_features, val_features = extract_features(
-        events, sensor_vocab, activity_vocab, sensor_embeddings,
-        args.window_size, args.stride, args.train_ratio, args.seed
-    )
-    print(f"   Train samples: {len(train_features):,}")
-    print(f"   Val samples: {len(val_features):,}")
+    # Feature cache 경로 생성 (파라미터 기반 해시)
+    cache_key = md5(f"{args.events_csv}_{args.window_size}_{args.stride}_{args.train_ratio}_{args.seed}_{args.use_dynamic_window}_{args.n_jobs}".encode()).hexdigest()[:16]
+    cache_dir = Path("data/feature_cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"features_{cache_key}.pkl"
+    
+    # Extract features (캐시 사용)
+    if args.use_cache and cache_path.exists():
+        print(f"\n📦 Loading cached features from {cache_path}")
+        with open(cache_path, 'rb') as f:
+            cached_data = pickle.load(f)
+            train_features = cached_data['train_features']
+            val_features = cached_data['val_features']
+        print(f"   Train samples: {len(train_features):,}")
+        print(f"   Val samples: {len(val_features):,}")
+    else:
+        dynamic_status = "ON" if args.use_dynamic_window else "OFF"
+        print(f"\n🔧 Extracting rich features (window={args.window_size}, stride={args.stride}, dynamic={dynamic_status}, seed={args.seed})")
+        train_features, val_features = extract_features(
+            events, sensor_vocab, activity_vocab, sensor_embeddings,
+            args.window_size, args.stride, args.train_ratio, args.seed,
+            args.use_dynamic_window, args.n_jobs
+        )
+        print(f"   Train samples: {len(train_features):,}")
+        print(f"   Val samples: {len(val_features):,}")
+        
+        # 캐시 저장
+        if args.use_cache:
+            print(f"   💾 Saving features to cache: {cache_path}")
+            with open(cache_path, 'wb') as f:
+                pickle.dump({
+                    'train_features': train_features,
+                    'val_features': val_features,
+                    'params': {
+                        'events_csv': args.events_csv,
+                        'window_size': args.window_size,
+                        'stride': args.stride,
+                        'train_ratio': args.train_ratio,
+                        'seed': args.seed,
+                        'use_dynamic_window': args.use_dynamic_window
+                    }
+                }, f)
+            print(f"   ✓ Cache saved successfully")
     
     # Datasets
     train_ds, val_ds = create_pv_datasets(
@@ -308,13 +447,17 @@ def main(args):
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size,
         shuffle=True, collate_fn=collate_pv_features,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        pin_memory=True,  # GPU 전송 속도 향상
+        persistent_workers=args.num_workers > 0  # 워커 재사용
     )
     
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size,
         shuffle=False, collate_fn=collate_pv_features,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0
     )
     
     # Model (자동 차원 계산)
@@ -369,7 +512,7 @@ def main(args):
         t0 = time.time()
         
         # Train
-        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device)
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, args.use_amp)
         
         # Validate
         val_metrics = eval_epoch(model, val_loader, criterion, device)
@@ -428,7 +571,7 @@ def main(args):
                 print(f"   Best epoch: {best_epoch} (Val F1: {best_val_f1:.2f}%)")
                 break
         
-        # History
+        # Append to history
         history.append({
             'epoch': epoch,
             'train_loss': train_metrics['loss'],
@@ -442,17 +585,19 @@ def main(args):
             **{f'train_{k}': v for k, v in train_metrics.items() if k.startswith('L_')},
             **{f'val_{k}': v for k, v in val_metrics.items() if k.startswith('L_')}
         })
+        
+        # Save history every epoch (in case of interruption)
+        history_path = Path(args.checkpoint).with_suffix('.history.json')
+        with open(history_path, 'w') as f:
+            json.dump(history, f, indent=2)
     
-    # Save history
-    history_path = Path(args.checkpoint).with_suffix('.history.json')
-    with open(history_path, 'w') as f:
-        json.dump(history, f, indent=2)
+    # Final history save message
+    print(f"\n   History saved to: {history_path}")
     
     print("\n" + "=" * 80)
     print(f"✅ Training complete!")
     print(f"   Best Val F1 (Macro): {best_val_f1:.2f}% at epoch {best_epoch}")
     print(f"   Model saved to: {args.checkpoint}")
-    print(f"   History saved to: {history_path}")
 
 
 if __name__ == "__main__":
@@ -478,6 +623,12 @@ if __name__ == "__main__":
                         help='Train/val split ratio')
     parser.add_argument('--embedding-dim', type=int, default=32,
                         help='Sensor embedding dimension (used if initializing randomly)')
+    parser.add_argument('--use-dynamic-window', action='store_true',
+                        help='Use dynamic window size for short activities (default: OFF)')
+    parser.add_argument('--n-jobs', type=int, default=-1,
+                        help='Number of parallel workers for feature extraction (-1: all CPUs, 1: no parallelism)')
+    parser.add_argument('--use-cache', action='store_true',
+                        help='Use cached features if available (saves extraction time)')
     
     # Model architecture
     parser.add_argument('--vel-dim', type=int, default=32,
@@ -508,6 +659,8 @@ if __name__ == "__main__":
                         help='Weight decay for AdamW (L2 regularization)')
     parser.add_argument('--patience', type=int, default=15,
                         help='Early stopping patience (epochs)')
+    parser.add_argument('--use-amp', action='store_true',
+                        help='Use Automatic Mixed Precision (AMP) for faster training')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device (cuda or cpu)')
     parser.add_argument('--num-workers', type=int, default=0,

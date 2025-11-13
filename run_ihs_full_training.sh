@@ -54,9 +54,13 @@ python train/train_pv_ihs.py \
     --events-csv data/ihsdata/processed/events.csv \
     --embeddings checkpoint/ihs_sensor_embeddings.pt \
     --checkpoint checkpoint/pv_model_ihs_full.pt \
-    --window-size 100 \
-    --stride 10 \
-    --batch-size 32 \
+    --window-size 50 \
+    --batch-size 2048 \
+    --use-cache \
+    --num-workers 8 \
+    --stride 5 \
+    --use-amp \
+    --n-jobs -1 \
     --epochs 200 \
     --learning-rate 3e-4 \
     --weight-decay 5e-4 \

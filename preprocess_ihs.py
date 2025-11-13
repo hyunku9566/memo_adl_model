@@ -37,6 +37,11 @@ STATE_TOKENS = {
     "PRESENT", "ABSENT", "TRUE", "FALSE"
 }
 
+# Activity name normalization (대소문자 통일)
+ACTIVITY_NORMALIZE = {
+    "Sleep_Out_of_Bed": "Sleep_Out_Of_Bed",  # 소문자 o -> 대문자 O
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -141,9 +146,14 @@ def parse_activity_field(activity_field: str) -> tuple[str, str]:
         parts = activity_field.split("=", 1)
         activity = parts[0].strip()
         phase = parts[1].strip().strip('"\'')  # Remove quotes
-        return activity, phase
     else:
-        return activity_field.strip(), ""
+        activity = activity_field.strip()
+        phase = ""
+    
+    # Normalize activity name (대소문자 통일)
+    activity = ACTIVITY_NORMALIZE.get(activity, activity)
+    
+    return activity, phase
 
 
 def classify_value(raw_value: str) -> tuple[str, Optional[float], str]:
