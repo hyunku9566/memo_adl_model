@@ -87,11 +87,6 @@ class AdditiveAttention(nn.Module):
 # ==================== Core Components ====================
 
 class PositionHead(nn.Module):
-    """
-    학습 가능한 센서 2D 위치
-    
-    선행 연구: 대부분 고정 위치 사용 → 우리는 end-to-end 학습 🆕
-    """
     
     def __init__(self, vocab_size: int, init_scale: float = 0.1):
         """
@@ -285,16 +280,7 @@ class VelocityHead(nn.Module):
 
 
 class MMU(nn.Module):
-    """
-    Movement Memory Unit (이동 메모리)
-    
-    이동 패턴을 누적 학습:
-    - 속도 벡터 시퀀스
-    - 누적 이동/정지 카운터
-    - GRU로 temporal dependencies 모델링
-    
-    노벨티: Movement-specific memory (선행 연구 거의 없음) 🆕
-    """
+  
     
     def __init__(self, in_dim: int, hid: int = 128):
         """
@@ -340,16 +326,6 @@ class MMU(nn.Module):
 
 
 class CMU(nn.Module):
-    """
-    Context Memory Unit (맥락 메모리)
-    
-    맥락/영역 정보를 누적 학습:
-    - 센서 임베딩 (어떤 센서가 활성화되었는지)
-    - EMA 평활화된 센서 상태
-    - 정지/머무름 패턴
-    
-    노벨티: Context-specific memory (선행 연구 거의 없음) 🆕
-    """
     
     def __init__(self, in_dim: int, hid: int = 128):
         """
@@ -387,17 +363,6 @@ class CMU(nn.Module):
 
 
 class GateAndTrigger(nn.Module):
-    """
-    게이트 + 트리거 메커니즘
-    
-    게이트 g_t로 MMU/CMU 출력을 동적으로 융합:
-    - 이동 중이면 MMU 가중치 ↑
-    - 정지 중이면 CMU 가중치 ↑
-    
-    트리거 스코어: 활동 전환 시점 감지 (옵션)
-    
-    노벨티: Movement-triggered gating (선행 연구 없음) 🆕
-    """
     
     def __init__(self, h_move: int, h_ctx: int):
         """
@@ -510,23 +475,6 @@ class TemporalEncoder(nn.Module):
 # ==================== Top-level Model ====================
 
 class SmartHomeModel(nn.Module):
-    """
-    Position-Velocity-MMU/CMU 통합 모델
-    
-    전체 파이프라인:
-    1. PositionHead: 센서 ID → 2D 위치
-    2. VelocityHead: 위치 차분 → 속도/방향 특징
-    3. MMU/CMU: 이동/맥락 메모리
-    4. GateAndTrigger: 동적 융합
-    5. TemporalEncoder: TCN → BiGRU → Attention
-    6. Classifier: 최종 활동 분류
-    
-    노벨티:
-    - 학습 가능한 센서 위치 🆕
-    - MMU/CMU 이중 메모리 🆕
-    - Movement-triggered gating 🆕
-    """
-    
     def __init__(
         self,
         num_sensors: int,
@@ -731,51 +679,3 @@ class MultiTaskLoss(nn.Module):
         )
         
         return total, losses
-
-
-# ==================== Test Code ====================
-
-if __name__ == "__main__":
-    """간단한 동작 테스트"""
-    torch.manual_seed(0)
-    
-    # Dummy data
-    B, T = 4, 100
-    num_sensors = 30
-    F_base = 98  # 30 + 30 + 6 + 32 (frame + ema + vel + emb)
-    n_classes = 5
-    
-    X_base = torch.randn(B, T, F_base)
-    ids = torch.randint(0, num_sensors, (B, T))
-    ts = torch.cumsum(torch.rand(B, T), dim=1)  # cumulative timestamps
-    
-    # Model
-    model = SmartHomeModel(
-        num_sensors=num_sensors,
-        base_feat_dim=F_base,
-        sensor_emb_dim=32,
-        vel_dim=32,
-        enc_hid=128,
-        mmu_hid=128,
-        cmu_hid=128,
-        n_classes=n_classes
-    )
-    
-    # Forward
-    logits, aux = model(X_base, ids, ts, return_aux=True)
-    print(f"✓ logits shape: {logits.shape}")  # [B, C]
-    print(f"✓ pos shape: {aux['pos'].shape}")  # [B, T, 2]
-    print(f"✓ vel shape: {aux['vel'].shape}")  # [B, T, 32]
-    print(f"✓ move_flag shape: {aux['move_flag'].shape}")  # [B, T]
-    print(f"✓ gate shape: {aux['gate'].shape}")  # [B, T]
-    
-    # Loss
-    loss_fn = MultiTaskLoss(lambda_move=1.0, lambda_pos=0.1, lambda_smooth=0.01)
-    y = torch.randint(0, n_classes, (B,))
-    total, ld = loss_fn(logits, y, aux, model.pos_head.positions)
-    print(f"\n✓ total_loss: {total.item():.4f}")
-    print(f"✓ loss_dict: {ld}")
-    
-    # Parameter count
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"\n✓ Total parameters: {n_params:,}")

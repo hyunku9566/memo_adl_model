@@ -63,7 +63,8 @@ def extract_features(
     sensor_embeddings: np.ndarray,
     window_size: int,
     stride: int,
-    train_ratio: float = 0.8
+    train_ratio: float = 0.8,
+    seed: int = 42
 ) -> Tuple[List, List]:
     """
     RichFeatures 추출 및 train/val 분할
@@ -93,7 +94,8 @@ def extract_features(
         )
         all_features.extend(features)
     
-    # Train/val split
+    # Train/val split with seed
+    np.random.seed(seed)
     np.random.shuffle(all_features)
     split_idx = int(len(all_features) * train_ratio)
     train_features = all_features[:split_idx]
@@ -248,10 +250,10 @@ def main(args):
     print(f"   Embedding shape: {sensor_embeddings.shape}")
     
     # Extract features
-    print(f"\n🔧 Extracting rich features (window={args.window_size}, stride={args.stride})")
+    print(f"\n🔧 Extracting rich features (window={args.window_size}, stride={args.stride}, seed={args.seed})")
     train_features, val_features = extract_features(
         events, sensor_vocab, activity_vocab, sensor_embeddings,
-        args.window_size, args.stride, args.train_ratio
+        args.window_size, args.stride, args.train_ratio, args.seed
     )
     print(f"   Train samples: {len(train_features):,}")
     print(f"   Val samples: {len(val_features):,}")
@@ -457,6 +459,16 @@ if __name__ == "__main__":
                         help='Device (cuda or cpu)')
     parser.add_argument('--num-workers', type=int, default=0,
                         help='DataLoader workers')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducibility')
     
     args = parser.parse_args()
+    
+    # Set random seeds
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+    
     main(args)
